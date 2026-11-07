@@ -1,0 +1,23 @@
+# One instance per device: /etc/unifi-device-bridge/<name>.toml
+#   systemctl enable --now unifi-device-bridge@<name>
+[Unit]
+Description=unifi-device-bridge %i: show a non-UniFi device in UniFi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m unifi_device_bridge -c /etc/unifi-device-bridge/%i.toml
+WorkingDirectory=/opt/unifi-device-bridge
+# Runs as root so it can update host in the config (root-only, chmod 600) when UniFi changes the IP.
+# Everything else on the system stays read-only.
+ReadWritePaths=/etc/unifi-device-bridge
+# Each instance keeps its own MAC and adoption key in /var/lib/unifi-device-bridge/%i
+StateDirectory=unifi-device-bridge/%i
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

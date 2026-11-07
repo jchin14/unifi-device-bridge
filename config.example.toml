@@ -1,0 +1,74 @@
+# unifi-device-bridge config, one file per device: /etc/unifi-device-bridge/<name>.toml
+
+# Your UniFi controller's inform address (UDM/UDR/UCG: the gateway IP, port 8080).
+inform_url = "http://192.168.1.1:8080/inform"
+
+# Name shown in UniFi before you rename it there.
+name = "Office switch"
+
+# Model to show in UniFi, and its PoE ports:
+#   US8 (8, no PoE), US8P60 (8, PoE 5-8), USL8LP (8, PoE 1-4), USL16LP (16, PoE 1-8),
+#   US16P150 (16, all PoE), US24 (24), US24P250 (24, all PoE), US48 (48)
+# model = "US8"
+
+# Number of ports to show. Defaults to the model's port count.
+# ports = 8
+
+# "reversed" shows switch port 8 as UniFi port 1, so a switch with PoE on 1-4
+# lines up with the US8P60's PoE ports 5-8. Port names keep the switch's numbers.
+# port_order = "normal"
+
+# Port (switch's own numbering) that goes back to your router or another switch. Clients seen on it aren't claimed.
+uplink_port = 1
+
+# IP shown in UniFi. Defaults to the switch's host below, or this machine's IP.
+# device_ip = "192.168.1.20"
+
+# Let UniFi turn ports and PoE on/off (port profile "Disabled", PoE "Off").
+# The uplink port is never disabled. SNMP needs write_community (or v3 write access).
+# manage_ports = false
+
+# Let UniFi change the switch's IP (device Settings > IP Configuration).
+# Easy Smart only for now. A wrong IP can cut the switch off, so it's off by default.
+# manage_ip = false
+
+# Use the switch's own MAC (read from it) so UniFi shows what it's plugged into.
+# Changing this means adopting it again. Set device_mac to force one.
+# use_switch_mac = true
+# device_mac = "aa:bb:cc:dd:ee:ff"
+
+# Firmware version reported to UniFi. Normally leave unset: clicking Update in UniFi
+# downloads nothing, the bridge just starts reporting the new version.
+# firmware_version = "7.5.15.17146"
+
+# snmp (any managed switch), easysmart (TP-Link Easy Smart web UI) or fake (testing).
+driver = "snmp"
+
+[snmp]
+host = "192.168.1.20"
+version = "2c"            # 1, 2c or 3
+community = "public"
+# write_community = "private"   # only for manage_ports
+# v3:
+# user = "monitor"
+# auth_password = "..."
+# auth_protocol = "SHA"   # MD5, SHA, SHA-256...
+# priv_password = "..."
+# priv_protocol = "AES"
+# ifIndex of each switch port in order, if the auto-detected Ethernet ports are wrong
+# (see them with: unifi-device-bridge --poll).
+# ports = [1, 2, 3, 4, 5, 6, 7, 8]
+
+[easysmart]
+host = "192.168.1.20"
+username = "admin"
+password = "admin"
+
+[fake]
+up_ports = [1, 2]
+
+# For switches without LLDP (e.g. Easy Smart): what the uplink port plugs into,
+# so UniFi can show "Connected To". mac = that device's MAC (e.g. your gateway).
+# [uplink_neighbor]
+# mac = "aa:bb:cc:dd:ee:ff"
+# name = "Gateway"
