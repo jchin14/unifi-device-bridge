@@ -19,6 +19,9 @@ BRIDGE_FDB_STATUS = "1.3.6.1.2.1.17.4.3.1.3"
 PSE_ADMIN = "1.3.6.1.2.1.105.1.1.1.3"   # pethPsePortAdminEnable.group.port: 1 on, 2 off
 PSE_STATUS = "1.3.6.1.2.1.105.1.1.1.6"  # pethPsePortDetectionStatus: 3 delivering power
 LLDP_REM = "1.0.8802.1.1.2.1.4.1.1"      # .col.timeMark.localPort.index
+HR_CPU = "1.3.6.1.2.1.25.3.3.1.2"        # hrProcessorLoad, percent per CPU
+HR_STORAGE = "1.3.6.1.2.1.25.2.3.1"      # 2 type, 4 allocation units, 5 size, 6 used
+HR_RAM = "1.3.6.1.2.1.25.2.1.2"          # hrStorageRam
 ETHERNET_TYPES = {6, 117}                # ethernetCsmacd, gigabitEthernet
 
 
@@ -65,6 +68,19 @@ def column(table, col):
     """{'8.3': v} rows of one table column -> {'3': v}."""
     head = f"{col}."
     return {k[len(head):]: v for k, v in table.items() if k.startswith(head)}
+
+
+def host_resources(cpu, storage):
+    """HOST-RESOURCES-MIB walks -> (cpu %, memory %, memory bytes), None where not reported."""
+    loads = [v for v in cpu.values() if isinstance(v, int)]
+    cpu_pct = round(sum(loads) / len(loads), 1) if loads else None
+    for idx, typ in column(storage, 2).items():
+        if str(typ).lstrip(".") != HR_RAM:
+            continue
+        units, size, used = (column(storage, c).get(idx) for c in (4, 5, 6))
+        if all(isinstance(v, int) for v in (units, size, used)) and size > 0:
+            return cpu_pct, round(used * 100 / size, 1), size * units
+    return cpu_pct, None, None
 
 
 def mac_str(raw):
@@ -229,7 +245,9 @@ class SnmpDriver:
             ))
 
         uptime = system.get("3.0")
+        cpu, mem, mem_total = host_resources(self.walk(HR_CPU), self.walk(HR_STORAGE))
         return Snapshot(
+            cpu=cpu, mem=mem, mem_total=mem_total,
             ports=ports, neighbors=neighbors,
             uptime=uptime // 100 if isinstance(uptime, int) else None,
             description=text(system.get("1.0")),

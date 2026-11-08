@@ -12,4 +12,7 @@ def make_driver(cfg, port_count):
     if name == "fake":
         from .fake import FakeDriver
         return FakeDriver(cfg.get("fake", {}), port_count)
-    raise DriverError(f"unknown driver {name!r} (use snmp, easysmart or fake)")
+    if name == "virtual":
+        from .virtual import VirtualDriver
+        return VirtualDriver(cfg.get("virtual", {}), port_count, seed=cfg.get("name", ""))
+    raise DriverError(f"unknown driver {name!r} (use snmp, easysmart, virtual or fake)")

@@ -39,6 +39,9 @@ class Snapshot:
     description: str = ""
     can_see_clients: bool = True # False for drivers with no MAC table
     mac: str | None = None       # the switch's own MAC, if the driver can read it
+    cpu: float | None = None     # percent, if known
+    mem: float | None = None     # percent, if known
+    mem_total: int | None = None # bytes, if known
 
 
 class DriverError(RuntimeError):

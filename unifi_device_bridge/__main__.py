@@ -1,4 +1,4 @@
-"""unifi-device-bridge: show non-UniFi devices in UniFi Network. Today: a managed switch as a UniFi Switch 8."""
+"""unifi-device-bridge: show non-UniFi devices in UniFi Network: managed switches, or virtual switches and APs."""
 import argparse
 import json
 import logging
@@ -6,16 +6,17 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import inform, report
+from . import inform, report, stats
 from .drivers import DriverError, make_driver
 
-VERSION = "0.26.1"  # kept in sync with VERSION by scripts/bump.sh
+VERSION = "0.26.2"  # kept in sync with VERSION by scripts/bump.sh
 log = logging.getLogger("bridge")
 
 
@@ -26,6 +27,7 @@ class State:
         self.path = path
         self.network = None       # IP settings from the last controller config, applied once
         self.ports = None         # port settings from the last controller config, applied once
+        self.vlans = None         # VLANs from the last controller config, applied once
         try:
             with open(path) as f:
                 self.data = json.load(f)
@@ -51,6 +53,48 @@ class State:
 def state_file(cfg):
     """One state file per device. systemd sets STATE_DIRECTORY per service instance."""
     return cfg.get("state_file") or os.path.join(os.environ.get("STATE_DIRECTORY", "/var/lib/unifi-device-bridge"), "state.json")
+
+
+def device_configs(cfg):
+    """A config with [[device]] entries runs several devices in one process (handy for virtual ones).
+    Each entry overrides the top-level settings and gets its own state file, named after the device."""
+    entries = cfg.get("device")
+    if not entries:
+        return [cfg]
+    base = {k: v for k, v in cfg.items() if k != "device"}
+    state_dir = os.path.dirname(state_file(base))
+    out, slugs = [], set()
+    for i, entry in enumerate(entries, 1):
+        c = {**base, **entry}
+        c.setdefault("name", f"Device {i}")
+        slug = re.sub(r"[^a-z0-9]+", "-", c["name"].lower()).strip("-") or str(i)
+        if slug in slugs:
+            raise ValueError(f"two devices are named {c['name']!r}: give each a different name")
+        slugs.add(slug)
+        c["state_file"] = entry.get("state_file") or os.path.join(state_dir, f"{slug}.json")
+        out.append(c)
+    return out
+
+
+def run_all(cfgs, once=False):
+    """Run each device in its own thread. One device failing doesn't stop the others."""
+    if len(cfgs) == 1:
+        return run(cfgs[0], once=once)
+    results = {}
+
+    def one(c):
+        try:
+            results[c["name"]] = run(c, once=once)
+        except Exception as e:   # bad config for one device: keep the rest going
+            log.error("%s stopped: %s", c["name"], e)
+            results[c["name"]] = f"error: {e}"
+
+    threads = [threading.Thread(target=one, args=(c,), name=c["name"], daemon=True) for c in cfgs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return "\n".join(f"{name}: {status}" for name, status in results.items())
 
 
 def inform_url_by_ip(url):
@@ -92,6 +136,62 @@ def ports_from_system_cfg(text):
         elif m.group(2) == "poe":
             p["poe"] = val != "off"
     return ports
+
+
+def vlans_from_system_cfg(text):
+    """UniFi system_cfg -> {"vlans": {vid: {"tagged": {port}, "untagged": {port}}}, "pvid": {port: vid}},
+    UniFi port numbers, or None if it has no VLANs. Keys: switch.vlan.<i>.id, switch.vlan.<i>.mode (the VLAN's
+    default for ports not listed; unset means tagged, so every VLAN reaches every port) and switch.vlan.<i>.port.<p>.mode = tagged/untagged/exclude."""
+    kv = dict(l.split("=", 1) for l in text.splitlines() if "=" in l and not l.startswith("#"))
+    ids, modes, per_port, ports = {}, {}, {}, set()
+    for key, val in kv.items():
+        if m := re.fullmatch(r"switch\.vlan\.(\d+)\.id", key):
+            ids[int(m.group(1))] = int(val)
+        elif m := re.fullmatch(r"switch\.vlan\.(\d+)\.mode", key):
+            modes[int(m.group(1))] = val
+        elif m := re.fullmatch(r"switch\.vlan\.(\d+)\.port\.(\d+)\.mode", key):
+            per_port.setdefault(int(m.group(1)), {})[int(m.group(2))] = val
+        elif m := re.fullmatch(r"switch\.port\.(\d+)\.\w+", key):
+            ports.add(int(m.group(1)))
+    if not ids:
+        return None
+    vlans, pvid = {}, {}
+    for i, vid in ids.items():
+        if not 1 <= vid <= 4094:
+            continue
+        v = vlans.setdefault(vid, {"tagged": set(), "untagged": set()})
+        for p in ports:
+            mode = per_port.get(i, {}).get(p, modes.get(i, "tagged"))
+            if mode == "untagged":
+                v["untagged"].add(p)
+                pvid[p] = vid
+            elif mode == "tagged":
+                v["tagged"].add(p)
+    return {"vlans": vlans, "pvid": pvid}
+
+
+def apply_vlans(driver, cfg, wanted, ports, reverse):
+    """Make the switch's 802.1Q VLANs match UniFi's port profiles / networks."""
+    if not (wanted and cfg.get("manage_vlans", True) and hasattr(driver, "set_vlans")):
+        return
+    sw = (lambda p: ports + 1 - p) if reverse else (lambda p: p)
+    want = {"vlans": {vid: {k: {sw(p) for p in v[k] if p <= ports} for k in ("tagged", "untagged")}
+                      for vid, v in wanted["vlans"].items()},
+            "pvid": {sw(p): vid for p, vid in wanted["pvid"].items() if p <= ports}}
+    # Never cut the bridge off: the uplink stays an untagged member of VLAN 1 (management).
+    up = cfg.get("uplink_port")
+    if up:
+        up = sw(up)
+        v1 = want["vlans"].setdefault(1, {"tagged": set(), "untagged": set()})
+        if up not in v1["untagged"]:
+            log.warning("keeping switch port %s untagged in VLAN 1: it's the uplink", up)
+            for v in want["vlans"].values():
+                v["untagged"].discard(up)
+            v1["tagged"].discard(up)
+            v1["untagged"].add(up)
+            want["pvid"][up] = 1
+    log.info("applying VLANs %s", sorted(want["vlans"]))
+    driver.set_vlans(want)
 
 
 def apply_ports(driver, cfg, wanted, snap, ports, reverse):
@@ -183,6 +283,7 @@ def handle(reply, state):
         if reply.get("system_cfg"):
             state.network = network_from_system_cfg(reply["system_cfg"])
             state.ports = ports_from_system_cfg(reply["system_cfg"])
+            state.vlans = vlans_from_system_cfg(reply["system_cfg"])
         cfg = reply.get("cfgversion") or mgmt.get("cfgversion")
         if cfg:
             state.data["cfgversion"] = cfg
@@ -246,10 +347,11 @@ def run(cfg, once=False):
         use_host(driver, cfg, state.data["host"])
     started = time.time()
     delay, last_status = 10, None
+    last_vlans = None
     first_seen = {}   # (port, mac) -> when we first saw it, for client uptime
     while True:
         try:
-            snap = reorder(driver.poll(), ports, reverse)
+            snap = stats.fill(reorder(driver.poll(), ports, reverse), cfg)
             # Use the switch's real MAC so UniFi can see where it's plugged in ("Connected To").
             mac = (cfg.get("device_mac") or (snap.mac if cfg.get("use_switch_mac", True) else None) or "").lower()
             if mac and mac != state.data["mac"]:
@@ -260,11 +362,19 @@ def run(cfg, once=False):
             seen = {(p.index, m) for p in snap.ports for m, _ in p.macs}
             first_seen = {k: first_seen.get(k, now) for k in seen}
             body = report.build(snap, state.data, cfg, inform_url_by_ip(cfg["inform_url"]), started, first_seen)
+            before = state.data.get("cfgversion")
             reply = send(cfg, state, body)
             delay = handle(reply, state)
+            if state.data.get("cfgversion") != before and hasattr(driver, "resume"):
+                driver.resume()   # you just changed something in UniFi: don't wait out the web UI pause
             if state.ports:
                 wanted, state.ports = state.ports, None
                 apply_ports(driver, cfg, wanted, snap, ports, reverse)
+            if state.vlans:
+                wanted, state.vlans = state.vlans, None
+                if wanted != last_vlans:
+                    apply_vlans(driver, cfg, wanted, ports, reverse)
+                    last_vlans = wanted
             if state.network:
                 wanted, state.network = state.network, None
                 apply_network(driver, cfg, wanted, state)
@@ -293,26 +403,33 @@ def main():
     ap.add_argument("--reset", action="store_true", help="forget the adoption key (keeps the MAC)")
     ap.add_argument("--version", action="version", version=VERSION)
     args = ap.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s" if os.environ.get("INVOCATION_ID") else
-                        "%(asctime)s %(message)s", stream=sys.stdout)
     with open(args.config, "rb") as f:
         cfg = tomllib.load(f)
     cfg["_path"] = args.config
+    cfgs = device_configs(cfg)
+    fmt = "%(message)s" if os.environ.get("INVOCATION_ID") else "%(asctime)s %(message)s"
+    if len(cfgs) > 1:
+        fmt = fmt.replace("%(message)s", "[%(threadName)s] %(message)s")
+    logging.basicConfig(level=logging.INFO, format=fmt, stream=sys.stdout)
     if args.poll:
-        snap = make_driver(cfg, int(cfg.get("ports", 8))).poll()
-        for p in snap.ports:
-            print(f"{p.index:>2} {p.name:<12} {'up' if p.up else 'down':<4} {p.speed or '-':>5} "
-                  f"rx={p.rx_bytes} tx={p.tx_bytes} {', '.join(m for m, _ in p.macs)}")
-        for n in snap.neighbors:
-            print(f"lldp port {n.port}: {n.name or n.chassis_id} {n.port_id}")
+        for c in cfgs:
+            if len(cfgs) > 1:
+                print(f"== {c['name']}")
+            snap = make_driver(c, int(c.get("ports") or report.model_info(c)[2])).poll()
+            for p in snap.ports:
+                print(f"{p.index:>2} {p.name:<12} {'up' if p.up else 'down':<4} {p.speed or '-':>5} "
+                      f"rx={p.rx_bytes} tx={p.tx_bytes} {', '.join(m for m, _ in p.macs)}")
+            for n in snap.neighbors:
+                print(f"lldp port {n.port}: {n.name or n.chassis_id} {n.port_id}")
         return
     if args.reset:
-        State(state_file(cfg)).reset()
+        for c in cfgs:
+            State(state_file(c)).reset()
         print("adoption reset")
         return
     if "inform_url" not in cfg:
         sys.exit("set inform_url in the config, e.g. http://192.168.1.1:8080/inform")
-    print(run(cfg, once=args.once) if args.once else run(cfg))
+    print(run_all(cfgs, once=args.once))
 
 
 if __name__ == "__main__":

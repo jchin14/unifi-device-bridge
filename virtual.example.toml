@@ -1,0 +1,52 @@
+# Virtual UniFi devices: they adopt and show up in UniFi with moving traffic, PoE draw,
+# CPU and memory, but nothing real is behind them. Just for looks.
+#   sudo cp virtual.example.toml /etc/unifi-device-bridge/virtual.toml
+#   sudo systemctl enable --now unifi-device-bridge@virtual
+# Then click Adopt on each one in UniFi > Devices.
+
+inform_url = "http://192.168.1.1:8080/inform"
+driver = "virtual"
+
+# Let port and PoE on/off in UniFi "work" (remembered until restart).
+manage_ports = true
+
+# CPU and memory (%) shown on each device page, as flat lines. Override per device if you like.
+cpu_percent = 10
+mem_percent = 45
+
+# Settings here apply to every device below; each [[device]] can override them.
+# up_ports: ports shown as connected (default: a random mix, same every restart).
+# poe_watts: rough PoE draw per powered port.
+[virtual]
+poe_watts = 4.5
+
+# One block per device. Names must be different. Switch models: US8, US8P60, USL8LP, USL16LP,
+# US16P150, US24, US24P250, US48. AP models:
+#   Wi-Fi 5: UAP-AC-Lite, UAP-AC-LR, UAP-AC-Pro, UWB-XG (WiFi BaseStation XG)
+#   Wi-Fi 6: U6-Lite, U6-LR, U6-Pro
+#   Wi-Fi 7: U7-Pro, U7-Pro-Max, U7-Pro-XG, U7-Pro-XGS, E7, E7-Audience
+
+[[device]]
+name = "Core Switch"
+model = "US24P250"
+uplink_port = 1
+
+[[device]]
+name = "Garage Switch"
+model = "USL8LP"
+uplink_port = 1
+# device_ip = "192.168.1.60"   # IP shown in UniFi (default: this machine's)
+
+[[device]]
+name = "Living Room AP"
+model = "U7-Pro-XGS"
+
+[[device]]
+name = "Auditorium AP"
+model = "E7-Audience"
+
+[[device]]
+name = "Backyard AP"
+model = "U6-LR"
+# One channel per radio, lowest band first (default: picked per device).
+virtual = { channels = [11, 149] }

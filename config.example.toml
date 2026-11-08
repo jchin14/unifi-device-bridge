@@ -18,7 +18,8 @@ name = "Office switch"
 # lines up with the US8P60's PoE ports 5-8. Port names keep the switch's numbers.
 # port_order = "normal"
 
-# Port (switch's own numbering) that goes back to your router or another switch. Clients seen on it aren't claimed.
+# Port (switch's own numbering) that goes back to your router or another switch. Any port works.
+# Clients seen on it aren't claimed, it's never disabled and it stays untagged in VLAN 1.
 uplink_port = 1
 
 # IP shown in UniFi. Defaults to the switch's host below, or this machine's IP.
@@ -32,10 +33,21 @@ uplink_port = 1
 # Easy Smart only for now. A wrong IP can cut the switch off, so it's off by default.
 # manage_ip = false
 
+# Let UniFi set the switch's VLANs (port profiles / native and tagged networks).
+# Easy Smart only for now. On by default: every VLAN is tagged on every port unless a
+# port profile in UniFi says otherwise. The uplink port always stays untagged in VLAN 1.
+# manage_vlans = true
+
 # Use the switch's own MAC (read from it) so UniFi shows what it's plugged into.
 # Changing this means adopting it again. Set device_mac to force one.
 # use_switch_mac = true
 # device_mac = "aa:bb:cc:dd:ee:ff"
+
+# CPU and memory (%) shown on the device page when the switch can't report its own
+# (Easy Smart can't; SNMP switches with HOST-RESOURCES-MIB send real numbers instead).
+# Shown as flat lines. Leave unset to show nothing.
+# cpu_percent = 10
+# mem_percent = 45
 
 # Firmware version reported to UniFi. Normally leave unset: clicking Update in UniFi
 # downloads nothing, the bridge just starts reporting the new version.
@@ -63,12 +75,19 @@ community = "public"
 host = "192.168.1.20"
 username = "admin"
 password = "admin"
+# The switch counts packets, not bytes, so UniFi's traffic is an estimate: packets x this size.
+# bytes_per_packet = 700
+# The web UI allows one login at a time. If you log in, the bridge pauses this long (seconds)
+# so it doesn't kick you out.
+# webui_pause = 600
 
 [fake]
 up_ports = [1, 2]
 
-# For switches without LLDP (e.g. Easy Smart): what the uplink port plugs into,
-# so UniFi can show "Connected To". mac = that device's MAC (e.g. your gateway).
+# For switches without LLDP (e.g. Easy Smart): the UniFi device the uplink port
+# plugs into, so UniFi can show "Connected To". Use the device it's really cabled
+# to (UniFi > device > Ports shows this switch's MAC on that port), not the gateway.
 # [uplink_neighbor]
 # mac = "aa:bb:cc:dd:ee:ff"
-# name = "Gateway"
+# name = "Office Switch"
+# port = "Port 8"
