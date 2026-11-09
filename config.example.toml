@@ -21,22 +21,56 @@ name = "Office switch"
 # Port (switch's own numbering) that goes back to your router or another switch. Any port works.
 # Clients seen on it aren't claimed, it's never disabled and it stays untagged in VLAN 1.
 uplink_port = 1
+# Easy Smart: find the uplink from the switch's packet counts (a short burst of packets) at start
+# and at each client scan. If the cable moved, use the new port (follow_uplink = false: just warn).
+# The config file isn't changed.
+# check_uplink = true
+# follow_uplink = true
+
+# Easy Smart: find clients per port by mirroring ports to this machine (it must be plugged into
+# the switch). Runs at start, every scan_interval seconds (0 = only when asked), after a settings
+# change in UniFi, after Reboot, on Locate and when the switch restarts. Each scan is about 8 flash writes on the switch.
+# scan_on_link: also scan when a port's link comes up (at most once per 10 minutes).
+# scan_clients = true
+# scan_on_link = true
+# scan_interval = 43200
+# scan_seconds = 10
+
+# Easy Smart: tell a UniFi device on the switch (e.g. an AP) which port it's on, by LLDP, so UniFi
+# shows it under this switch. The switch floods LLDP to every port, so this is only sent when
+# exactly one UniFi device is found on it.
+# lldp_announce = true
 
 # IP shown in UniFi. Defaults to the switch's host below, or this machine's IP.
 # device_ip = "192.168.1.20"
 
 # Let UniFi turn ports and PoE on/off (port profile "Disabled", PoE "Off").
-# The uplink port is never disabled. SNMP needs write_community (or v3 write access).
-# manage_ports = false
+# On by default. The uplink port is never disabled. SNMP needs write_community (or v3 write access).
+# manage_ports = true
 
 # Let UniFi change the switch's IP (device Settings > IP Configuration).
-# Easy Smart only for now. A wrong IP can cut the switch off, so it's off by default.
-# manage_ip = false
+# Easy Smart only for now. On by default. Only applied when you change it in UniFi.
+# manage_ip = true
 
 # Let UniFi set the switch's VLANs (port profiles / native and tagged networks).
 # Easy Smart only for now. On by default: every VLAN is tagged on every port unless a
 # port profile in UniFi says otherwise. The uplink port always stays untagged in VLAN 1.
 # manage_vlans = true
+
+# Rename the switch when you rename it in UniFi (Easy Smart only for now). UniFi passes
+# the name on without spaces or symbols, so "Shed Switch" becomes "ShedSwitch". On by default.
+# manage_name = true
+
+# Port speed/duplex, port mirroring and link aggregation from UniFi port settings
+# (Easy Smart only for now). On by default.
+# manage_switching = true
+
+# UniFi is in charge: its settings are applied at start and re-applied every this many seconds,
+# undoing changes made on the switch's own web page. 0 = only apply when UniFi sends a change.
+# enforce_interval = 300
+
+# When you remove (Forget) the device in UniFi, put the switch back to stock: VLANs off, all ports on.
+# restore_on_forget = true
 
 # Use the switch's own MAC (read from it) so UniFi shows what it's plugged into.
 # Changing this means adopting it again. Set device_mac to force one.

@@ -13,10 +13,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import inform, report, stats
+from . import inform, report, scan, stats, uplink
 from .drivers import DriverError, make_driver
 
-VERSION = "0.26.2"  # kept in sync with VERSION by scripts/bump.sh
+VERSION = "0.26.3"  # kept in sync with VERSION by scripts/bump.sh
 log = logging.getLogger("bridge")
 
 
@@ -25,9 +25,9 @@ class State:
 
     def __init__(self, path):
         self.path = path
-        self.network = None       # IP settings from the last controller config, applied once
-        self.ports = None         # port settings from the last controller config, applied once
-        self.vlans = None         # VLANs from the last controller config, applied once
+        self.forgotten = False    # removed in UniFi: put the switch back to stock
+        self.new_cfg = False      # a new config arrived from the controller and hasn't been applied yet
+        self.asked = None         # "reboot" or "locate" from the controller, not yet acted on
         try:
             with open(path) as f:
                 self.data = json.load(f)
@@ -170,6 +170,73 @@ def vlans_from_system_cfg(text):
     return {"vlans": vlans, "pvid": pvid}
 
 
+def name_from_system_cfg(text):
+    """UniFi system_cfg -> the device name as a hostname (UniFi keeps only letters, digits and hyphens,
+    31 max), or None if it's unset or still the model's default (e.g. US860W)."""
+    kv = dict(l.split("=", 1) for l in text.splitlines() if "=" in l and not l.startswith("#"))
+    name = kv.get("resolv.host.1.name", "").strip()
+    if not name or re.fullmatch(r"U[A-Z0-9-]*\d[A-Z0-9-]*", name):
+        return None
+    return name
+
+
+def switching_from_system_cfg(text):
+    """UniFi system_cfg -> {"speed": {port: "auto" or (Mb/s, full duplex)}, "mirror": {dest: {sources}},
+    "lags": {lag id: {ports}}}, UniFi port numbers. Keys: switch.port.N.autoneg=disabled with .speed and .duplex
+    (only sent when not auto), .opmode=mirror with .mirror_port, .opmode=aggregate with .lag."""
+    kv = dict(l.split("=", 1) for l in text.splitlines() if "=" in l and not l.startswith("#"))
+    per = {}
+    for key, val in kv.items():
+        if m := re.fullmatch(r"switch\.port\.(\d+)\.(\w+)", key):
+            per.setdefault(int(m.group(1)), {})[m.group(2)] = val
+    out = {"speed": {}, "mirror": {}, "lags": {}}
+    for p, k in per.items():
+        if k.get("autoneg") == "disabled" and k.get("speed", "").isdigit():
+            out["speed"][p] = (int(k["speed"]), k.get("duplex", "enabled") in ("enabled", "full", "true"))
+        else:
+            out["speed"][p] = "auto"
+        if k.get("opmode") == "mirror" and k.get("mirror_port", "").isdigit():
+            out["mirror"].setdefault(p, set()).add(int(k["mirror_port"]))
+        elif k.get("opmode") == "aggregate" and k.get("lag", "").isdigit():
+            out["lags"].setdefault(int(k["lag"]), set()).add(p)
+    return out
+
+
+def apply_switching(driver, cfg, wanted, ports, reverse):
+    """Speed/duplex, port mirroring and link aggregation from UniFi port profiles."""
+    if not (wanted and cfg.get("manage_switching", True) and hasattr(driver, "set_switching")):
+        return
+    sw = (lambda p: ports + 1 - p) if reverse else (lambda p: p)
+    codes = getattr(driver, "SPEEDS", {})
+    speed = {}
+    for p, s in wanted["speed"].items():
+        if p <= ports:
+            if s in codes:
+                speed[sw(p)] = codes[s]
+            else:
+                log.warning("UniFi port %s: speed %s isn't supported by the switch", p, s)
+    mirror = None
+    up = cfg.get("uplink_port")
+    for dest, srcs in sorted(wanted["mirror"].items()):
+        if dest == up:
+            log.warning("not mirroring to UniFi port %s: it's the uplink", dest)
+        elif mirror:
+            log.warning("the switch has one mirror port: ignoring the mirror on UniFi port %s", dest)
+        else:
+            mirror = (sw(dest), {sw(s) for s in srcs if s <= ports and s != dest})
+    lags = [{sw(p) for p in m if p <= ports} for _, m in sorted(wanted["lags"].items()) if len(m) > 1]
+    driver.set_switching({"speed": speed, "mirror": mirror, "lags": lags})
+
+
+def apply_name(driver, cfg, name):
+    """Rename the switch to match its name in UniFi."""
+    if not (name and cfg.get("manage_name", True) and hasattr(driver, "set_name")):
+        return
+    if driver.get_name() != name[:32]:
+        log.info("renaming the switch to %s", name)
+        driver.set_name(name)
+
+
 def apply_vlans(driver, cfg, wanted, ports, reverse):
     """Make the switch's 802.1Q VLANs match UniFi's port profiles / networks."""
     if not (wanted and cfg.get("manage_vlans", True) and hasattr(driver, "set_vlans")):
@@ -190,13 +257,15 @@ def apply_vlans(driver, cfg, wanted, ports, reverse):
             v1["tagged"].discard(up)
             v1["untagged"].add(up)
             want["pvid"][up] = 1
-    log.info("applying VLANs %s", sorted(want["vlans"]))
+    log.info("applying VLANs (switch ports): %s", "; ".join(
+        f"{vid} untagged {sorted(v['untagged']) or '-'} tagged {sorted(v['tagged']) or '-'}"
+        for vid, v in sorted(want["vlans"].items())))
     driver.set_vlans(want)
 
 
 def apply_ports(driver, cfg, wanted, snap, ports, reverse):
     """Turn ports and PoE on/off to match UniFi (port profile "Disabled", PoE "Off")."""
-    if not (wanted and cfg.get("manage_ports")):
+    if not (wanted and cfg.get("manage_ports", True)):
         return
     by_index = {p.index: p for p in snap.ports}
     for n, want in sorted(wanted.items()):
@@ -218,7 +287,7 @@ def apply_ports(driver, cfg, wanted, snap, ports, reverse):
 
 def apply_network(driver, cfg, wanted, state):
     """Make the switch's IP match UniFi's device settings (Settings > IP Configuration)."""
-    if not (wanted and cfg.get("manage_ip") and hasattr(driver, "set_ip")):
+    if not (wanted and cfg.get("manage_ip", True) and hasattr(driver, "set_ip")):
         return
     current = driver.get_ip()
     if wanted["dhcp"] == current["dhcp"] and (wanted["dhcp"] or all(
@@ -264,6 +333,19 @@ def save_host(path, section, host):
     return True
 
 
+def apply_saved(driver, cfg, state, snap, ports, reverse, new, scanning=False):
+    """Make the switch match UniFi's last config. Safe to repeat: each step only changes what differs.
+    The IP is only applied when it's new, since a wrong one cuts the bridge off."""
+    text = state.data["system_cfg"]
+    apply_ports(driver, cfg, ports_from_system_cfg(text), snap, ports, reverse)
+    apply_vlans(driver, cfg, vlans_from_system_cfg(text), ports, reverse)
+    apply_name(driver, cfg, name_from_system_cfg(text))
+    if not scanning:   # the client scan is using the mirror: leave switching alone until it's done
+        apply_switching(driver, cfg, switching_from_system_cfg(text), ports, reverse)
+    if new:
+        apply_network(driver, cfg, network_from_system_cfg(text), state)
+
+
 def use_host(driver, cfg, host):
     driver.set_host(host)
     cfg["device_ip"] = host
@@ -281,9 +363,8 @@ def handle(reply, state):
         if "use_aes_gcm" in mgmt:
             state.data["gcm"] = mgmt["use_aes_gcm"] in ("true", "1")
         if reply.get("system_cfg"):
-            state.network = network_from_system_cfg(reply["system_cfg"])
-            state.ports = ports_from_system_cfg(reply["system_cfg"])
-            state.vlans = vlans_from_system_cfg(reply["system_cfg"])
+            state.data["system_cfg"] = reply["system_cfg"]   # kept, so it's applied again after a restart
+            state.new_cfg = True
         cfg = reply.get("cfgversion") or mgmt.get("cfgversion")
         if cfg:
             state.data["cfgversion"] = cfg
@@ -292,6 +373,7 @@ def handle(reply, state):
     if kind == "setdefault":
         log.warning("controller forgot this device: resetting to unadopted")
         state.reset()
+        state.forgotten = True
         return 1
     if kind == "noop":
         return 1 if reply.get("immediate") else max(1, min(int(reply.get("interval", 10)), 300))
@@ -304,8 +386,18 @@ def handle(reply, state):
             state.data["firmware"] = version
             state.save()
         return 1
-    if kind in ("cmd", "reboot"):
-        log.info("ignoring controller %s (read-only bridge)", kind)
+    if kind == "reboot":
+        state.asked = "reboot"
+        return 1
+    if kind == "cmd":
+        what = reply.get("cmd", "")
+        if what == "reboot":
+            state.asked = "reboot"
+        elif what == "set-locate":
+            state.asked = "locate"
+        elif what != "unset-locate":
+            log.info("ignoring controller command %s", {k: v for k, v in reply.items() if k != "server_time_in_utc"})
+        return 1
     return 10
 
 
@@ -317,6 +409,39 @@ def send(cfg, state, body):
     with urllib.request.urlopen(req, timeout=15) as r:
         data = r.read()
     return inform.decode(data, key)[1]
+
+
+LINK_SCAN_WAIT = 5     # seconds after a link comes up before scanning
+LINK_SCAN_GAP = 600    # seconds between link-triggered scans
+
+
+def packet_total(snap):
+    """All ports' packet counts added up. They start from zero when the switch boots."""
+    return sum((p.rx_packets or 0) + (p.tx_packets or 0) for p in snap.ports)
+
+
+def rebooted(before, after):
+    """True if the counters went backwards: the switch restarted (or someone cleared them)."""
+    return before is not None and after < before
+
+
+def links_up(before, snap):
+    """Ports whose link came up since the last poll (switch numbering). None on the first poll."""
+    if before is None:
+        return []
+    return [p.index for p in snap.ports if p.up and not before.get(p.index, True)]
+
+
+def use_uplink(cfg, switch_port, ports, reverse):
+    """Use the uplink found from packet counts (switch numbering). Returns True if it changed."""
+    port = ports + 1 - switch_port if reverse else switch_port
+    if not cfg.get("follow_uplink", True) or cfg.get("uplink_port") == port:
+        return False
+    old = cfg.get("uplink_port")
+    cfg["uplink_port"] = port
+    if old:
+        log.info("uplink moved: now switch port %s (was %s)", switch_port, ports + 1 - old if reverse else old)
+    return True
 
 
 def reorder(snap, ports, reverse):
@@ -335,6 +460,7 @@ def run(cfg, once=False):
     ports = int(cfg.get("ports") or report.model_info(cfg)[2])
     driver = make_driver(cfg, ports)
     reverse = cfg.get("port_order", "normal") == "reversed"
+    cfg["_uplink_port_cfg"] = cfg.get("uplink_port")
     if reverse and cfg.get("uplink_port"):
         cfg["uplink_port"] = ports + 1 - cfg["uplink_port"]   # config uses the switch's own numbering
     # Show the switch's own IP in UniFi when we know it, otherwise this machine's.
@@ -345,13 +471,51 @@ def run(cfg, once=False):
     if state.data.get("host") and hasattr(driver, "set_host"):
         log.info("using switch IP %s set from UniFi", state.data["host"])
         use_host(driver, cfg, state.data["host"])
+    easysmart = cfg.get("driver") == "easysmart" and not once
+    scanning = easysmart and cfg.get("scan_clients", True)
+    if cfg.get("check_uplink", True) and easysmart:
+        found = uplink.check(driver, cfg)   # no MAC table or LLDP: find the uplink from packet counts
+        if found:
+            use_uplink(cfg, found[0], ports, reverse)
+    scanner = None
+    if scanning:
+        # No MAC table: find clients by mirroring ports to this machine, at start and every 12 hours.
+        scanner = scan.Scanner(driver, cfg, lambda: bool(state.data.get("system_cfg") and
+                                                         switching_from_system_cfg(state.data["system_cfg"])["mirror"]),
+                               lambda p: use_uplink(cfg, p, ports, reverse),
+                               lambda: (state.data["mac"], cfg.get("name", "unifi-device-bridge"),
+                                        lambda p: ports + 1 - p if reverse else p))
     started = time.time()
     delay, last_status = 10, None
-    last_vlans = None
+    # Re-apply UniFi's settings at start and every enforce_interval seconds, undoing changes made on the switch.
+    enforce = int(cfg.get("enforce_interval", 300))
+    next_enforce = 0
     first_seen = {}   # (port, mac) -> when we first saw it, for client uptime
+    last_total = None  # packet counters at the last poll, to notice the switch rebooting by itself
+    last_links = None  # port -> link up at the last poll, to scan when something is plugged in
+    link_up = None     # (when, ports) a link came up and a scan is still to be asked for
+    next_link_scan = 0  # at most one link-triggered scan per LINK_SCAN_GAP (each scan writes flash)
     while True:
         try:
-            snap = stats.fill(reorder(driver.poll(), ports, reverse), cfg)
+            snap = driver.poll()
+            if scanner:
+                total = packet_total(snap)
+                if rebooted(last_total, total):
+                    log.info("the switch restarted (its counters reset): scanning clients")
+                    scanner.request("switch restarted")
+                last_total = total
+                if cfg.get("scan_on_link", True):
+                    if ups := links_up(last_links, snap):
+                        link_up = (link_up[0] if link_up else time.time(), sorted(set(ups) | set(link_up[1] if link_up else ())))
+                    # Wait a few seconds so the new device has started talking.
+                    if link_up and time.time() >= max(link_up[0] + LINK_SCAN_WAIT, next_link_scan):
+                        named = ", ".join(str(ports + 1 - p if reverse else p) for p in link_up[1])
+                        log.info("link up on port %s: scanning clients", named)
+                        scanner.request(f"link up on port {named}")
+                        link_up, next_link_scan = None, time.time() + LINK_SCAN_GAP
+                last_links = {p.index: p.up for p in snap.ports}
+                scanner.fill(snap)
+            snap = stats.fill(reorder(snap, ports, reverse), cfg)
             # Use the switch's real MAC so UniFi can see where it's plugged in ("Connected To").
             mac = (cfg.get("device_mac") or (snap.mac if cfg.get("use_switch_mac", True) else None) or "").lower()
             if mac and mac != state.data["mac"]:
@@ -367,17 +531,40 @@ def run(cfg, once=False):
             delay = handle(reply, state)
             if state.data.get("cfgversion") != before and hasattr(driver, "resume"):
                 driver.resume()   # you just changed something in UniFi: don't wait out the web UI pause
-            if state.ports:
-                wanted, state.ports = state.ports, None
-                apply_ports(driver, cfg, wanted, snap, ports, reverse)
-            if state.vlans:
-                wanted, state.vlans = state.vlans, None
-                if wanted != last_vlans:
-                    apply_vlans(driver, cfg, wanted, ports, reverse)
-                    last_vlans = wanted
-            if state.network:
-                wanted, state.network = state.network, None
-                apply_network(driver, cfg, wanted, state)
+            if state.forgotten and state.data.get("authkey"):
+                state.forgotten = False   # adopted again before the reset finished: UniFi's settings win
+            if state.forgotten:
+                if hasattr(driver, "restore_defaults") and cfg.get("restore_on_forget", True):
+                    log.warning("removed from UniFi: putting the switch back to stock (VLANs off, all ports on)")
+                    driver.restore_defaults()   # if this fails, it's tried again next loop
+                    log.info("switch is back to stock")
+                state.forgotten = False
+            asked, state.asked = state.asked, None
+            if asked == "reboot":
+                if hasattr(driver, "reboot"):
+                    log.info("rebooting the switch (asked by UniFi)")
+                    if scanner:
+                        with scanner.lock:
+                            driver.reboot()
+                    else:
+                        driver.reboot()
+                    log.info("switch is back after the reboot")
+                    last_total = None   # its counters reset: not a second restart
+                    last_links, link_up = None, None   # links coming back aren't new devices
+                    if scanner:
+                        scanner.request("reboot")
+                else:
+                    log.info("ignoring reboot from UniFi (this driver can't reboot the switch)")
+            elif asked == "locate" and scanner:
+                scanner.request("locate")
+            due = enforce > 0 and time.time() >= next_enforce and time.time() >= getattr(driver, "paused_until", 0)
+            if state.data.get("system_cfg") and (state.new_cfg or due):
+                new = state.new_cfg
+                apply_saved(driver, cfg, state, snap, ports, reverse, new, scanner and scanner.busy())
+                state.new_cfg = False
+                next_enforce = time.time() + enforce
+                if new and scanner:
+                    scanner.request("settings changed in UniFi")
             status = "adopted" if state.data.get("authkey") else "waiting"
         except urllib.error.HTTPError as e:
             # 404 is normal before you click Adopt; 400 usually means the controller forgot our key.
